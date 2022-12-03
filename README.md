@@ -47,3 +47,135 @@ Where [option] is –c or –d  (-c = compress, -d = decompress)
 2. The source code for the project
 3. Metrics demonstrating the compression of the program. Compression numbers should break out any meta/dictionary information and present compression both with and without this data.
 4. Documentation on the algorithm and implementation
+
+# answer
+
+Overview
+========
+
+The code is written in C. I chose it because I wanted to be able to fully control sizes, though some segfaults and mallocs later I almost regretted it ;-) 
+It uses some GNU specialities like getopt, so it is not strictly ANSI/C99 but should be fairly portable. I only tested under a Ubuntu 17.10 system.
+
+Compile with 
+```gcc -Wall compress.c -o compress```
+
+It understands the following options:
+```  compress [-c|-d|-x] <inputfile> <outputfile>```
+
+-x enables the debug mode, in which the dictionary is not written.
+
+Compression ratio:
+==================
+
+Original:
+```
+>wc -c cmeebat.csv
+19113524 cmeebat.csv
+```
+
+With dictionary:
+```
+>wc -c outfile.dat
+5217222 outfile.dat
+```
+
+RATIO: ==> 1:3.663 or 72.70%
+
+Without dictionary:
+```
+>wc -c outfile-debug.dat
+5208981 outfile-debug.dat
+```
+
+RATIO: ==> 1:3.669 or 72.75%
+
+LZ77 comparision:
+```
+>wc -c cmeebat.csv.gz 
+4102227 cmeebat.csv.gz
+```
+
+RATIO: ==> 1:4.659 or 78.54%
+
+Implementation:
+==============
+
+Due to some design decisions (like the chosen language) I did not have the time to implement everything I wanted to:
+ * Especially the code to deal with the integer/mantissa breakdown and re-assembling took too much time, has likely some undiscovered edge cases and would need a cleanup/rewrite. Under real-world conditions I would have used a 3rd party library (such as mathlib) instead or coding it myself, therefore the compression is better data encoding.
+ * I would need to add return checks throughout the code, there is little to none error recognition. Also, it makes Valgrind cry.
+ * I would need to refactor/clean up some code, especially in do_compress & do_decompress are way too long.
+ * I currently read the input file twice, this can be optimised, by putting the dictionary at the end of the file
+ * One could use only a subset of the bits in a field (ie. using only 7bits in strings and reusing the 8th bit for flags).
+ * During the build-up of the dictionary I wanted to search for min/max values to size the fields.
+
+Assumptions
+-----------
+A few assumptions I took from the sample data, leading to design decisions:
+ * send & receive times are often the same
+ * the price and size often fits into a 2byte field
+ * the exchange flag is often the same
+ * the difference between the times are often very small (ie.<255 mseconds)
+
+The compression ration depends heavily on those assumptions.
+
+Ticker dictionary
+-----------------
+
+I use a dictionary for the ticker encoding, which is a simple list. With more time I would have changed it to a Huffman tree, the frequency is already collected. The dictionary is written at the beginning of the compressed file in the following format (each square is 1 byte):
+```
+[Y][Y] dictionary ID
+[X][X]...[X] ticker string
+[\0] null terminator
+```
+The dictionary ends when a ticker named "ENDOFDICTIONARY" is seen.
+
+Records
+-------
+
+There is a fixed record for each entry, with a additional record if needed. The fixed record is (1 square = 1 byte):
+```
+[A][A]                - dictionary ID
+[B]                   - condition value
+[C]                   - record flags/bitfield
+[D]                   - mantissa part of the price
+```
+Optional fields are
+```
+[E][E] or [E][E][E][E] - integer part of the price
+[F][F] or [F][F][F][F] - size of trade
+[G]                    - exchange
+[H]    or [H][H]       - send time, diff or full
+[I][I]                 - recvtime
+```
+the flags [C] are bit encoded and mean:
+```
+  bit 0-2 - "side" of the trade
+  bit 3   - if     set, the recvtime is the same as sendtime
+               not set there will be an [I] with the recvtime
+  bit 4   - if     set, the sendtime is [H] 1 byte diff to the previous one
+               not set the full sendtime [H][H] is added
+  bit 5   - if     set, the exchange is the same as the previous one
+               not set the full exchange [G] is added
+  bit 6   - if     set, the size is in a 2byte field [E][E]
+               not set the size is in a 4byte field [E][E][E][E]
+  bit 7   - if     set, the price is in a 2byte field [E][E]
+               not set the price is in a 4byte field [E][E][E][E]
+```
+So the minimum record size is 10 bytes:
+```
+[A][A][B][C][D][E][E][F][F][H]
+```
+
+maximum is 18 bytes:
+```
+[A][A][B][C][D][E][E][E][E][F][F][F][F][G][H][H][I][I]
+```
+
+Limitations
+-----------
+There are some assumptions I made regarding the data:
+ * maximum dictionary entries: 65535, (ID_DICT_T)
+ * maximum CSV line size: 1000, (MAXLINELENGTH)
+ * 255 maximum digits of the price (MANTISSA+string length)
+ * maximum integer part of the price +/- 2147483647 (PRICETYPE)
+ * no ticker can be named ENDOFDICTIONARY
