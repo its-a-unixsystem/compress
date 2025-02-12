@@ -1,955 +1,752 @@
 #include <stdio.h>
-#include <ctype.h>
 #include <stdlib.h>
 #include <stdint.h>
 #include <string.h>
+#include <ctype.h>
 #include <unistd.h>
 #include <errno.h>
-
+#include <stdbool.h>
 #include <inttypes.h>
 
+/* --- Constants and Type Definitions --- */
 
-/* maximum dictionary size 65k entries... */
 #define ID_DICT_T uint16_t
-
 #define ENDOFDICTIONARY "ENDOFDICTIONARY"
-
 #define LINEEND "\r\n"
 
 #define PRICETYPE int32_t
 #define SPRICETYPE int16_t
 #define MANTISSA int8_t
 
-/* what is a safe assumtion a maximum csv line is? */
-#define MAXLINELENGTH 1000
+#define MAX_LINE_LENGTH 1000
+#define CSV_BUFFER_SIZE 1024
+#define RECORD_SIZE 5  /* fixed record size for decompression */
 
-#define RECORDSIZE 5 /* minimum record */
+/// Global debug flag (set via command-line option -x)
+static bool debug = false;
 
-typedef uint8_t bool;
-#define true 1
-#define false 0
-
-typedef struct price_t
-{
-  PRICETYPE integer; // seen max 12733, 4bytes, no float for money...
-  MANTISSA mantissa; // seen 0.2265625, 2bytes...
+typedef struct {
+    PRICETYPE integer;  // For money, no floats
+    MANTISSA mantissa;  // The position at which to insert a decimal point
 } price_t;
 
-typedef struct TradeRecord_t
-{
-  char *ticker;           //  ticker string
-  unsigned char exchange;
-  char side;
-  char condition;
-  unsigned char flags; /*
-			 0 -\
-			 1   +- side encoding
-			 2 -/
-			 3 - sendtime=recvtime
-			 4 - sendtime is a diff to previous
-			 5 - exchange is same as previous
-			 6 - if set "size" is 4byte, otherwise 2byte
-			 7 - if set "price" is 4byte, otherwise 2byte
-			*/
-  uint32_t sendtime; //              uint:4294967295, maxsec/day: 86400000
-  uint8_t sendtimediff; //           max time diff=255
-  uint32_t recvtime;
-  price_t price;
-  uint32_t size;
+typedef struct {
+    char *ticker;           // Ticker string (dynamically allocated)
+    unsigned char exchange;
+    char side;
+    char condition;
+    unsigned char flags;    /* Bit flags:
+                               Bit0, Bit1, Bit2: Side encoding 
+                               Bit3: sendtime == recvtime 
+                               Bit4: sendtime stored as a diff to previous 
+                               Bit5: exchange same as previous 
+                               Bit6: size stored as 2 bytes (small) 
+                               Bit7: price stored as 2 bytes (small) 
+                            */
+    uint32_t sendtime;
+    uint8_t sendtimediff;
+    uint32_t recvtime;
+    price_t price;
+    uint32_t size;
 } TradeRecord_t;
 
-typedef struct ticker_dict_t
-{
-  ID_DICT_T frequency;
-  ID_DICT_T entry;
-  char *symbol;
-  struct ticker_dict_t* next;
+typedef struct ticker_dict {
+    ID_DICT_T frequency;
+    ID_DICT_T entry;
+    char *symbol;
+    struct ticker_dict *next;
 } ticker_dict_t;
 
-/* global var if we run in debug mode */
-bool debug = false;
+/* --- Bit Manipulation Helpers --- */
 
-void usage()
-{
-  printf("compress [-c|-d|-x] <inputfile> <outputfile>\n");
+static inline uint8_t set_bit(uint8_t flags, int bit) {
+    return flags | (1 << bit);
 }
 
-// shift string <buf> from position <pos> on <num> positions to the right
-char* strshiftr(char* buf,int pos,int num)
-{
-  int i;
-  for(i=1;i<=num;i++)
-    {
-      memmove(&buf[pos+1],&buf[pos],sizeof(&buf));      
-    }
-
-  return buf;
+static inline bool is_bit_set(uint8_t flags, int bit) {
+    return (flags & (1 << bit)) != 0;
 }
 
-// convert the structure <price> to a string
-char* parse_price_out(price_t price,char* return_buf)
-{
-  size_t memory_needed;
-  int i, offset,len;
+/* --- String Helpers --- */
 
-  memory_needed=snprintf(NULL, 0, "%" PRId32, price.integer);
-
-  // we are more than generous to account for -,. and \0
-  memory_needed=memory_needed+abs(price.mantissa)+3;
-
-
-  return_buf=malloc(memory_needed);
-  sprintf(return_buf, "%" PRId32, price.integer);
-
-  // account for - sign
-  offset=(price.integer<0?1:0);
-
-  // negative mantissa means shifting the number to the right,
-  // filling with zeros
-  if(price.mantissa<0)
-    {
-      return_buf=strshiftr(return_buf,0,abs(price.mantissa)+1);
-      
-      for(i=offset;i!=abs(price.mantissa)+offset+1;i++)
-	{
-	  return_buf[i]='0';
-	}
-
-      price.mantissa=abs(price.mantissa);
-
-      memmove(&return_buf[price.mantissa+1],
-       	      &return_buf[price.mantissa],
-       	      strlen(return_buf)-price.mantissa);
-    }
-  else
-    {
-      memmove(&return_buf[price.mantissa+1],
-	      &return_buf[price.mantissa],
-	      strlen(return_buf)-price.mantissa+1);
-    }
-
-  return_buf[price.mantissa+offset]='.';
-
-  // we account for special cases
-  
-  if(return_buf[0]=='.') // single dot in front
-    {
-      len=strlen(return_buf);
-      return_buf=strshiftr(return_buf,0,1);
-      return_buf[0]='0';
-      return_buf[len+1]='\0';
-    }
-  else if(strncmp(&return_buf[0],"-.",2)==0) // minus-dot in front
-    {
-      len=strlen(return_buf);
-      return_buf=strshiftr(return_buf,1,1);
-      return_buf[0]='-';
-      return_buf[1]='0';
-      return_buf[len+1]='\0';
-    }
-  else if(return_buf[strlen(return_buf)-1]=='.') // trailing dot
-    {
-      return_buf[strlen(return_buf)-1]='\0';
-    }  
-
-  // edge cases not caught, TODO/FIXME
-  if(strncmp(&return_buf[0],"00.",3)==0)
-    {
-      return_buf[0]='0';
-      return_buf[1]='.';
-      return_buf[2]='0'; 
-    }
-  else if(strncmp(&return_buf[0],"-00.",4)==0)
-    {
-      return_buf[0]='-';
-      return_buf[1]='0';
-      return_buf[2]='.';
-      return_buf[3]='0'; 
-    }
-
-  // output format for single 0 is 0
-  // above logic produces 0.0 though
-  if(strcmp(return_buf,"0.0")==0)
-    {
-      strcpy(return_buf,"0");
-    }
-
-  return return_buf;
+/**
+ * shift_string_right
+ * Shifts the substring starting at position pos in str to the right by shift characters.
+ */
+static void shift_string_right(char *str, int pos, int shift) {
+    size_t len = strlen(str);
+    memmove(str + pos + shift, str + pos, len - pos + 1);  // +1 to include the null terminator
 }
 
-// we parse a string into integer+mantissa
-price_t parse_price_in(char buf[256])
-{
-  char* pos_decimal;
-  price_t price;
-  int i,offset;
+/* --- Price Conversion Functions --- */
 
-
-  pos_decimal=strstr(buf, ".");
-  if(pos_decimal==NULL)
-    {
-      pos_decimal=&buf[(strlen(buf))];
+/**
+ * price_to_string
+ *
+ * Converts a price_t value into its string representation.
+ * This function allocates memory which must be freed by the caller.
+ */
+char* price_to_string(price_t price) {
+    // Determine required buffer size:
+    // Start with the length needed for the integer portion.
+    int int_len = snprintf(NULL, 0, "%" PRId32, price.integer);
+    int extra = abs(price.mantissa) + 3; // extra room for '.', possible sign, and '\0'
+    size_t buf_size = int_len + extra;
+    char *buf = malloc(buf_size);
+    if (!buf) {
+        perror("malloc failed in price_to_string");
+        exit(EXIT_FAILURE);
     }
-  
-  price.mantissa=(int)(pos_decimal-buf); // length-position of .
-  
-  // shift
-  memmove(&buf[pos_decimal-buf],
-	  &buf[pos_decimal-buf+1],
-	  strlen(buf)-(int)(pos_decimal-buf));
+    snprintf(buf, buf_size, "%" PRId32, price.integer);
 
-  price.integer=atoi(buf);
-  offset=(price.integer<0?1:0);
-  
-  if(price.integer<0) // account for negative sign
-    {
-      price.mantissa--;
+    int offset = (price.integer < 0) ? 1 : 0;
+    
+    if (price.mantissa < 0) {
+        int shift_amount = abs(price.mantissa) + 1;
+        shift_string_right(buf, 0, shift_amount);
+        for (int i = offset; i < abs(price.mantissa) + offset + 1; i++) {
+            buf[i] = '0';
+        }
+        price.mantissa = abs(price.mantissa);
+        memmove(buf + price.mantissa + 1, buf + price.mantissa, strlen(buf) - price.mantissa + 1);
+    } else {
+        memmove(buf + price.mantissa + 1, buf + price.mantissa, strlen(buf) - price.mantissa + 1);
     }
+    buf[price.mantissa + offset] = '.';
 
-  // if number starts with a 0 or -0
-  // move the mantissa
-  if((buf[0]=='0') || (buf[1]=='0' && price.integer<0))
-    {
-      for(i=offset;buf[i]=='0';i++)
-	{
-	  price.mantissa--;
-	}
+    // Special-case handling
+    if (buf[0] == '.') {
+        shift_string_right(buf, 0, 1);
+        buf[0] = '0';
+    } else if (strncmp(buf, "-.", 2) == 0) {
+        shift_string_right(buf, 1, 1);
+        buf[0] = '-';
+        buf[1] = '0';
+    } else if (buf[strlen(buf) - 1] == '.') {
+        buf[strlen(buf) - 1] = '\0';
     }
-  
-  return price; 
+    
+    if (strncmp(buf, "00.", 3) == 0) {
+        buf[0] = '0';
+        buf[1] = '.';
+        buf[2] = '0';
+    } else if (strncmp(buf, "-00.", 4) == 0) {
+        buf[0] = '-';
+        buf[1] = '0';
+        buf[2] = '.';
+        buf[3] = '0';
+    }
+    
+    if (strcmp(buf, "0.0") == 0) {
+        strcpy(buf, "0");
+    }
+    
+    return buf;
 }
 
-// bitfield manipulations
-char setBit(char bit,char byte)
-{
-  byte |= (1 << bit);
-  return byte;
+/**
+ * parse_price_from_string
+ *
+ * Parses a string representing a price (e.g. "123.45") into a price_t value.
+ * Uses a local copy so that the original string is not modified.
+ */
+price_t parse_price_from_string(const char *price_str) {
+    price_t price;
+    char buffer[256];
+    strncpy(buffer, price_str, sizeof(buffer) - 1);
+    buffer[sizeof(buffer)-1] = '\0';
+    
+    char *pos_decimal = strchr(buffer, '.');
+    if (!pos_decimal) {
+        pos_decimal = buffer + strlen(buffer);
+    }
+    price.mantissa = (int)(pos_decimal - buffer);
+    
+    // Remove the decimal point from the string
+    memmove(pos_decimal, pos_decimal + 1, strlen(pos_decimal + 1) + 1);
+    
+    price.integer = atoi(buffer);
+    int offset = (price.integer < 0) ? 1 : 0;
+    
+    if (price.integer < 0) {
+        price.mantissa--;
+    }
+    
+    if ((buffer[0] == '0') || (price.integer < 0 && buffer[1] == '0')) {
+        for (int i = offset; buffer[i] == '0'; i++) {
+            price.mantissa--;
+        }
+    }
+    
+    return price;
 }
 
-bool getBit(char bit,char byte)
-{
-  bool ret;
-  ret=(byte & (1 << bit));
-  return  ret;
+/* --- CSV Parsing --- */
+
+/**
+ * parse_csv_line
+ *
+ * Parses a CSV line (assumed to have at least 7 comma–separated fields) and returns
+ * a TradeRecord_t structure. The caller is responsible for freeing the allocated ticker string.
+ */
+TradeRecord_t parse_csv_line(const char *csv_line) {
+    TradeRecord_t record;
+    char line_copy[CSV_BUFFER_SIZE];
+    strncpy(line_copy, csv_line, sizeof(line_copy) - 1);
+    line_copy[sizeof(line_copy)-1] = '\0';
+    
+    char *token;
+    char *rest = line_copy;
+    
+    // Ticker
+    token = strtok_r(rest, ",", &rest);
+    if (!token) { fprintf(stderr, "CSV parse error: missing ticker\n"); exit(EXIT_FAILURE); }
+    record.ticker = strdup(token);
+    
+    // Exchange, side, condition
+    token = strtok_r(NULL, ",", &rest);
+    if (!token) { fprintf(stderr, "CSV parse error: missing exchange\n"); exit(EXIT_FAILURE); }
+    record.exchange = token[0];
+    
+    token = strtok_r(NULL, ",", &rest);
+    if (!token) { fprintf(stderr, "CSV parse error: missing side\n"); exit(EXIT_FAILURE); }
+    record.side = token[0];
+    
+    token = strtok_r(NULL, ",", &rest);
+    if (!token) { fprintf(stderr, "CSV parse error: missing condition\n"); exit(EXIT_FAILURE); }
+    record.condition = token[0];
+    
+    // Initialize flags to 0 and set side encoding flags.
+    record.flags = 0;
+    switch(record.side) {
+        case 'A':
+            record.flags = set_bit(record.flags, 0);
+            break;
+        case 'a':
+            record.flags = set_bit(record.flags, 1);
+            break;
+        case 'B':
+            record.flags = set_bit(record.flags, 0);
+            record.flags = set_bit(record.flags, 1);
+            break;
+        case 'b':
+            record.flags = set_bit(record.flags, 2);
+            break;
+        case 'T':
+            record.flags = set_bit(record.flags, 0);
+            record.flags = set_bit(record.flags, 2);
+            break;
+        default:
+            break;
+    }
+    
+    // Parse times
+    token = strtok_r(NULL, ",", &rest);
+    if (!token) { fprintf(stderr, "CSV parse error: missing sendtime\n"); exit(EXIT_FAILURE); }
+    record.sendtime = (uint32_t)atoi(token);
+    
+    token = strtok_r(NULL, ",", &rest);
+    if (!token) { fprintf(stderr, "CSV parse error: missing recvtime\n"); exit(EXIT_FAILURE); }
+    record.recvtime = (uint32_t)atoi(token);
+    
+    if (record.sendtime == record.recvtime) {
+        record.flags = set_bit(record.flags, 3);
+    }
+    
+    // Parse price and size (price comes first)
+    token = strtok_r(NULL, ",", &rest);
+    if (!token) { fprintf(stderr, "CSV parse error: missing price\n"); exit(EXIT_FAILURE); }
+    record.price = parse_price_from_string(token);
+    
+    token = strtok_r(NULL, ",", &rest);
+    if (!token) { fprintf(stderr, "CSV parse error: missing size\n"); exit(EXIT_FAILURE); }
+    record.size = (uint32_t)atoi(token);
+    
+    return record;
 }
 
-// parse a CSV line into a structure
-TradeRecord_t parse_CSV(char CSVLineIn[1024])
-{
-  char* tmp_token;
-  
-  struct TradeRecord_t DataRecord;
-  
-  tmp_token=strtok(CSVLineIn, ",");
-  DataRecord.ticker=strdup(tmp_token);
-  
-  // get exchange, side, condition
-  DataRecord.exchange = strtok(NULL, ",")[0]; // only the first byte
-  DataRecord.side = strtok(NULL, ",")[0];
-  DataRecord.condition = strtok(NULL, ",")[0];
+/* --- Dictionary (Linked List) Functions --- */
 
-  // encode some flags
-  DataRecord.flags=0;
-  
-  if(DataRecord.side=='A')
-    {
-      DataRecord.flags=setBit(0,DataRecord.flags);
+/**
+ * new_dict_list_entry
+ *
+ * Creates a new ticker_dict_t node with the given symbol and next pointer.
+ * The Dictionary counter (passed by pointer) is used to assign the node’s entry ID.
+ */
+ticker_dict_t* new_dict_list_entry(const char *symbol, ticker_dict_t *next, ID_DICT_T *dictionary_counter) {
+    ticker_dict_t *node = malloc(sizeof(ticker_dict_t));
+    if (!node) {
+        perror("Failed to allocate dictionary list entry");
+        exit(EXIT_FAILURE);
     }
-  else if(DataRecord.side=='a')
-    {
-      DataRecord.flags=setBit(1,DataRecord.flags);
+    node->symbol = strdup(symbol);
+    if (!node->symbol) {
+        perror("Failed to allocate symbol");
+        exit(EXIT_FAILURE);
     }
-  else if(DataRecord.side=='B')
-    {
-      DataRecord.flags=setBit(0,DataRecord.flags);
-      DataRecord.flags=setBit(1,DataRecord.flags);      
-    }
-  else if(DataRecord.side=='b')
-    {
-      DataRecord.flags=setBit(2,DataRecord.flags);
-    }
-  else if(DataRecord.side=='T')
-    {
-      DataRecord.flags=setBit(0,DataRecord.flags);
-      DataRecord.flags=setBit(2,DataRecord.flags);
-    }
-
-  // times
-  DataRecord.sendtime = atoi(strtok(NULL, ","));
-  DataRecord.recvtime = atoi(strtok(NULL, ","));
-  
-  if(DataRecord.sendtime == DataRecord.recvtime)
-    {
-      DataRecord.flags=setBit(3,DataRecord.flags);
-    }
-  
-  // we parse price later, lets not confuse strtok
-  tmp_token=strtok(NULL, ",");
-  DataRecord.size = atoi(strtok(NULL, ","));
-
-  DataRecord.price = parse_price_in(tmp_token);
-
-  return DataRecord;
+    node->frequency = 1;
+    node->entry = (*dictionary_counter);
+    node->next = next;
+    
+    (*dictionary_counter)++;
+    return node;
 }
 
-// list helper functions
+/**
+ * add_dict_list
+ *
+ * Adds a new node (with the given symbol) to the head of the dictionary list.
+ */
+ticker_dict_t* add_dict_list(const char *symbol, ticker_dict_t *list, ID_DICT_T *dictionary_counter) {
+    return new_dict_list_entry(symbol, list, dictionary_counter);
+}
 
-// create a new node
-ticker_dict_t* NewDictListEntry(char* symbol, ticker_dict_t* next, ID_DICT_T* DictionaryNumber)
-{
-  ticker_dict_t* node = malloc(sizeof(ticker_dict_t));
-  if(node == NULL)
-    {
-      perror("Oh-oh, error creating new list item.\n");
-      exit(-1);
+/**
+ * increment_dict_list_entry
+ *
+ * Searches for the given symbol in the list. If found, increments its frequency and returns its entry ID.
+ */
+ID_DICT_T increment_dict_list_entry(const char *symbol, ticker_dict_t *list) {
+    ticker_dict_t *current = list;
+    while (current != NULL) {
+        if (strcmp(symbol, current->symbol) == 0) {
+            current->frequency++;
+            return current->entry;
+        }
+        current = current->next;
     }
-  node->symbol = malloc(strlen(symbol)+1);
-  strcpy(node->symbol,symbol);
-  node->frequency = 1;
-  node->entry = *DictionaryNumber;
-  node->next = next;
-
-  (*DictionaryNumber)++;
-
-  return node;
+    return 0;  // Not found; caller should have added it.
 }
 
-// wrapper / TODO
-ticker_dict_t* AddDictList(char* symbol, ticker_dict_t* ListStart,ID_DICT_T* DictionaryNumber)
-{
-  ticker_dict_t* node = NewDictListEntry(symbol,ListStart,DictionaryNumber);
-  ListStart = node;
-
-  return ListStart;
-}
-
-// increase count for frequency
-ID_DICT_T IncDictListEntry(char* symbol, ticker_dict_t* ListStart)
-{
-  ticker_dict_t *pointer = ListStart;
-  
-  while(pointer!=NULL)
-    {
-      if(strcmp(symbol,pointer->symbol)==0)
-	{
-	  pointer->frequency++;
-	  return pointer->entry;
-	}
-        pointer = pointer->next;
+/**
+ * find_dict_list_entry
+ *
+ * Searches for the given symbol and returns its entry ID.
+ */
+ID_DICT_T find_dict_list_entry(const char *symbol, ticker_dict_t *list) {
+    ticker_dict_t *current = list;
+    while (current != NULL) {
+        if (strcmp(symbol, current->symbol) == 0) {
+            return current->entry;
+        }
+        current = current->next;
     }
-  return ListStart->entry;
+    return 0;
 }
 
-// search for symbol, return ID
-ID_DICT_T FindDictListEntry(char* symbol, ticker_dict_t* ListStart)
-{
-  ticker_dict_t *pointer = ListStart;
-  
-  while(pointer!=NULL)
-    {
-      if(strcmp(symbol,pointer->symbol)==0)
-	{
-	  return pointer->entry;
-	}
-        pointer = pointer->next;
-    }
-  
-  return 0;
-}
-
-// search for ID, return symbol
-char* FindDictListSymbol(ID_DICT_T entry, ticker_dict_t* ListStart)
-{
-  ticker_dict_t *pointer = ListStart;
-
-
-  while(pointer!=NULL)
-    {
-      if(entry==pointer->entry)
-	{
-	  return pointer->symbol;
-	}
-        pointer = pointer->next;
-    }
-  
-  return NULL;
-}
-
-// look up if symbol already exists
-// TODO merge with FindDictListEntry
-ticker_dict_t* DictListSearch(char* symbol,ticker_dict_t* ListStart)
-{
- 
-  ticker_dict_t *pointer = ListStart;
-  while(pointer!=NULL)
-    {
-      if(!strcmp(pointer->symbol,symbol))
-	{
-	  return pointer;
-	}
-        pointer = pointer->next;
+/**
+ * find_dict_list_symbol
+ *
+ * Searches for the given entry ID and returns the associated symbol.
+ */
+char* find_dict_list_symbol(ID_DICT_T entry, ticker_dict_t *list) {
+    ticker_dict_t *current = list;
+    while (current != NULL) {
+        if (entry == current->entry) {
+            return current->symbol;
+        }
+        current = current->next;
     }
     return NULL;
 }
 
-// free space
-void DestroyDictList(ticker_dict_t *ListStart)
-{
-    ticker_dict_t *pointer, *tmp_list;
- 
-    if(ListStart != NULL)
-    {
-      pointer = ListStart->next;
-      ListStart->next = NULL;
-      while(pointer != NULL)
-        {
-	  tmp_list = pointer->next;
-	  free(pointer->symbol);
-	  free(pointer);
-	  pointer = tmp_list;
+/**
+ * dict_list_search
+ *
+ * Returns a pointer to the node with the given symbol (or NULL if not found).
+ */
+ticker_dict_t* dict_list_search(const char *symbol, ticker_dict_t *list) {
+    ticker_dict_t *current = list;
+    while (current != NULL) {
+        if (strcmp(current->symbol, symbol) == 0) {
+            return current;
+        }
+        current = current->next;
+    }
+    return NULL;
+}
+
+/**
+ * destroy_dict_list
+ *
+ * Frees the entire dictionary list.
+ */
+void destroy_dict_list(ticker_dict_t *list) {
+    ticker_dict_t *current;
+    while (list != NULL) {
+        current = list;
+        list = list->next;
+        free(current->symbol);
+        free(current);
+    }
+}
+
+/**
+ * dump_dictionary
+ *
+ * Writes the dictionary to the provided file handle.
+ */
+void dump_dictionary(ticker_dict_t *dict, FILE *dict_file) {
+    const unsigned char terminator = 0;
+    const char dict_end[] = ENDOFDICTIONARY;
+    
+    ticker_dict_t *current = dict;
+    while (current != NULL) {
+        fwrite(&current->entry, sizeof(current->entry), 1, dict_file);
+        fwrite(current->symbol, strlen(current->symbol), 1, dict_file);
+        fwrite(&terminator, sizeof(char), 1, dict_file);
+        current = current->next;
+    }
+    /* Write extra terminators and dictionary end marker */
+    fwrite(&terminator, sizeof(terminator), 2, dict_file);
+    fwrite(dict_end, sizeof(dict_end), 1, dict_file);
+}
+
+/**
+ * read_dictionary
+ *
+ * Reads the dictionary from the given file handle.
+ */
+ticker_dict_t* read_dictionary(ticker_dict_t *dict, FILE *dict_file) {
+    ID_DICT_T number = 0;
+    char *line = NULL;
+    size_t len = 0;
+    ssize_t read_len;
+    char *symbol = NULL;
+    
+    while (fread(&number, sizeof(ID_DICT_T), 1, dict_file) == 1 &&
+           (read_len = getdelim(&line, &len, '\0', dict_file)) > 0) {
+        symbol = realloc(symbol, strlen(line) + 1);
+        if (!symbol) {
+            perror("realloc failed in read_dictionary");
+            exit(EXIT_FAILURE);
+        }
+        memcpy(symbol, line, strlen(line));
+        symbol[strlen(line)] = '\0';
+        
+        /* Check for dictionary terminator */
+        if (strcmp(symbol, ENDOFDICTIONARY) == 0) {
+            break;
+        }
+        dict = add_dict_list(symbol, dict, &number);
+    }
+    
+    if (errno) {
+        perror("Error reading dictionary");
+    }
+    free(line);
+    free(symbol);
+    return dict;
+}
+
+/* --- Compression Functionality --- */
+
+/**
+ * do_compress
+ *
+ * Reads CSV lines from input_file, builds a dictionary and encodes the records into output_file.
+ */
+void do_compress(FILE *input_file, FILE *output_file, ticker_dict_t *dict) {
+    char line[MAX_LINE_LENGTH];
+    TradeRecord_t record;
+    ID_DICT_T dictionary_counter = 1;
+    ID_DICT_T tmp_dictionary_number = 0;
+    FILE *dict_file = NULL;
+    
+    int64_t time_diff = 0;
+    uint32_t last_time = 0;
+    uint16_t size_small = 0;
+    SPRICETYPE price_small = 0;
+    char last_exchange = 0;
+    
+    /* If debug mode is enabled, write the dictionary to a temporary file */
+    if (debug) {
+        dict_file = tmpfile();
+        if (!dict_file) {
+            perror("Error creating temporary dictionary file");
+            exit(EXIT_FAILURE);
+        }
+    } else {
+        dict_file = output_file;
+    }
+    
+    printf("Pass 1 - building dictionary\n");
+    while (fgets(line, sizeof(line), input_file) != NULL) {
+        line[strcspn(line, "\r\n")] = '\0';  // Remove line endings
+        
+        record = parse_csv_line(line);
+        
+        if (!dict_list_search(record.ticker, dict)) {
+            dict = add_dict_list(record.ticker, dict, &dictionary_counter);
+        } else {
+            increment_dict_list_entry(record.ticker, dict);
+        }
+        free(record.ticker);
+    }
+    
+    rewind(input_file);
+    
+    printf("Pass 2 - encoding data\n");
+    
+    /* Write the dictionary */
+    dump_dictionary(dict, dict_file);
+    
+    while (fgets(line, sizeof(line), input_file) != NULL) {
+        line[strcspn(line, "\r\n")] = '\0';  // Remove line endings
+        record = parse_csv_line(line);
+        
+        time_diff = record.sendtime - last_time;
+        if (abs(time_diff) > 254 || last_time > record.sendtime) {
+            record.sendtimediff = 0;
+        } else {
+            record.sendtimediff = (uint8_t)time_diff;
+            record.flags = set_bit(record.flags, 4);
+        }
+        
+        if (last_exchange == record.exchange) {
+            record.flags = set_bit(record.flags, 5);
+        }
+        
+        if (record.size < 65534) {
+            size_small = (uint16_t)record.size;
+            record.flags = set_bit(record.flags, 6);
+        }
+        
+        if (abs(record.price.integer) < 32767) {
+            price_small = (SPRICETYPE)record.price.integer;
+            record.flags = set_bit(record.flags, 7);
+        }
+        
+        tmp_dictionary_number = find_dict_list_entry(record.ticker, dict);
+        
+        /* Write fixed record fields: ticker ID, condition, flags, mantissa */
+        fwrite(&tmp_dictionary_number, sizeof(ID_DICT_T), 1, output_file);
+        fwrite(&record.condition, sizeof(record.condition), 1, output_file);
+        fwrite(&record.flags, sizeof(record.flags), 1, output_file);
+        fwrite(&record.price.mantissa, sizeof(record.price.mantissa), 1, output_file);
+        
+        /* Write price: small (2 bytes) or large (4 bytes) */
+        if (is_bit_set(record.flags, 7)) {
+            fwrite(&price_small, sizeof(price_small), 1, output_file);
+        } else {
+            fwrite(&record.price.integer, sizeof(record.price.integer), 1, output_file);
+        }
+        
+        /* Write size: small (2 bytes) or large (4 bytes) */
+        if (is_bit_set(record.flags, 6)) {
+            fwrite(&size_small, sizeof(size_small), 1, output_file);
+        } else {
+            fwrite(&record.size, sizeof(record.size), 1, output_file);
+        }
+        
+        /* Write exchange if it differs from the previous record */
+        if (!is_bit_set(record.flags, 5)) {
+            fwrite(&record.exchange, sizeof(record.exchange), 1, output_file);
+        }
+        
+        /* Write send time or time difference */
+        if (is_bit_set(record.flags, 4)) {
+            fwrite(&record.sendtimediff, sizeof(record.sendtimediff), 1, output_file);
+        } else {
+            fwrite(&record.sendtime, sizeof(record.sendtime), 1, output_file);
+        }
+        
+        /* Write recv time if not equal to send time */
+        if (!is_bit_set(record.flags, 3)) {
+            fwrite(&record.recvtime, sizeof(record.recvtime), 1, output_file);
+        }
+        
+        free(record.ticker);
+        last_exchange = record.exchange;
+        last_time = record.sendtime;
+    }
+}
+
+/**
+ * do_decompress
+ *
+ * Reads compressed data from input_file, decodes it (using the stored dictionary) and writes CSV lines to output_file.
+ */
+void do_decompress(FILE *input_file, FILE *output_file, ticker_dict_t *dict) {
+    size_t bytes_read;
+    char input_data[RECORD_SIZE];
+    void *cursor;
+    TradeRecord_t record;
+    ID_DICT_T entry_id;
+    char *symbol;
+    uint16_t size_small = 0;
+    char last_exchange = 0;
+    SPRICETYPE price_small = 0;
+    uint32_t last_time = 0;
+    
+    printf("Decompressing...\n");
+    
+    /* Read the dictionary from the file */
+    dict = read_dictionary(dict, input_file);
+    
+    while ((bytes_read = fread(input_data, RECORD_SIZE, 1, input_file)) == 1) {
+        memcpy(&entry_id, input_data, sizeof(ID_DICT_T));
+        cursor = input_data + sizeof(ID_DICT_T);
+        
+        memcpy(&record.condition, cursor, sizeof(record.condition));
+        cursor += sizeof(record.condition);
+        
+        memcpy(&record.flags, cursor, sizeof(record.flags));
+        cursor += sizeof(record.flags);
+        
+        memcpy(&record.price.mantissa, cursor, sizeof(record.price.mantissa));
+        cursor += sizeof(record.price.mantissa);
+        
+        /* Decode the side from the flags */
+        if (is_bit_set(record.flags, 0) && !is_bit_set(record.flags, 1) && !is_bit_set(record.flags, 2)) {
+            record.side = 'A';
+        } else if (!is_bit_set(record.flags, 0) && is_bit_set(record.flags, 1) && !is_bit_set(record.flags, 2)) {
+            record.side = 'a';
+        } else if (is_bit_set(record.flags, 0) && is_bit_set(record.flags, 1) && !is_bit_set(record.flags, 2)) {
+            record.side = 'B';
+        } else if (!is_bit_set(record.flags, 0) && !is_bit_set(record.flags, 1) && is_bit_set(record.flags, 2)) {
+            record.side = 'b';
+        } else if (is_bit_set(record.flags, 0) && !is_bit_set(record.flags, 1) && is_bit_set(record.flags, 2)) {
+            record.side = 'T';
+        }
+        
+        /* Read price (small or large) */
+        if (is_bit_set(record.flags, 7)) {
+            bytes_read = fread(input_data, 2, 1, input_file);
+            memcpy(&price_small, input_data, sizeof(price_small));
+            record.price.integer = price_small;
+        } else {
+            bytes_read = fread(input_data, 4, 1, input_file);
+            memcpy(&record.price.integer, input_data, sizeof(record.price.integer));
+        }
+        char *price_str = price_to_string(record.price);
+        
+        /* Read size (small or large) */
+        if (is_bit_set(record.flags, 6)) {
+            bytes_read = fread(input_data, 2, 1, input_file);
+            memcpy(&size_small, input_data, sizeof(size_small));
+            record.size = size_small;
+        } else {
+            bytes_read = fread(input_data, 4, 1, input_file);
+            memcpy(&record.size, input_data, sizeof(record.size));
+        }
+        
+        /* Read exchange (either same as previous or stored explicitly) */
+        if (is_bit_set(record.flags, 5)) {
+            record.exchange = last_exchange;
+        } else {
+            bytes_read = fread(input_data, 1, 1, input_file);
+            memcpy(&record.exchange, input_data, sizeof(record.exchange));
+        }
+        
+        /* Read send time (either full timestamp or a diff) */
+        if (is_bit_set(record.flags, 4)) {
+            bytes_read = fread(input_data, 1, 1, input_file);
+            memcpy(&record.sendtimediff, input_data, sizeof(record.sendtimediff));
+            record.sendtime = last_time + record.sendtimediff;
+        } else {
+            bytes_read = fread(input_data, 4, 1, input_file);
+            memcpy(&record.sendtime, input_data, sizeof(record.sendtime));
+        }
+        
+        /* Read recv time if different */
+        if (is_bit_set(record.flags, 3)) {
+            record.recvtime = record.sendtime;
+        } else {
+            bytes_read = fread(input_data, 4, 1, input_file);
+            memcpy(&record.recvtime, input_data, sizeof(record.recvtime));
+        }
+        
+        symbol = find_dict_list_symbol(entry_id, dict);
+        if (!symbol) {
+            fprintf(stderr, "Symbol not found for entry %u\n", entry_id);
+            exit(EXIT_FAILURE);
+        }
+        
+        fprintf(output_file, "%s,%c,%c,%c,%u,%u,%s,%u%s",
+                symbol,
+                record.exchange,
+                record.side,
+                record.condition,
+                record.sendtime,
+                record.recvtime,
+                price_str,
+                record.size,
+                LINEEND);
+        
+        free(price_str);
+        last_time = record.sendtime;
+        last_exchange = record.exchange;
+    }
+}
+
+/* --- Main --- */
+
+int main (int argc, char **argv) {
+    bool compress = true;  /* default mode: compress */
+    char *input_filename = NULL;
+    char *output_filename = NULL;
+    FILE *input_file = NULL, *output_file = NULL;
+    ticker_dict_t *ticker_dict = NULL;
+    int opt;
+    
+    /* Parse command-line options */
+    opterr = 0;
+    while ((opt = getopt(argc, argv, "cdx")) != -1) {
+        switch (opt) {
+            case 'c':
+                compress = true;
+                break;
+            case 'd':
+                compress = false;
+                break;
+            case 'x':
+                debug = true;
+                break;
+            case '?':
+                if (isprint(optopt))
+                    fprintf(stderr, "Unknown option `-%c'.\n", optopt);
+                else
+                    fprintf(stderr, "Unknown option character `\\x%x'.\n", optopt);
+                return EXIT_FAILURE;
+            default:
+                abort();
         }
     }
-}
-
-// write the dictionary to dictfd
-void DumpDictionary(ticker_dict_t* ticker_dictionary_start, FILE* dictfd)
-{
-  ticker_dict_t* pointer = ticker_dictionary_start;
-  unsigned char terminator=0;
-
-  char dictend[]=ENDOFDICTIONARY;
-  
-
-  while(pointer != NULL)
-    {
-      fwrite(&pointer->entry,
-	     sizeof(pointer->entry),
-	     1,
-	     dictfd);
-      
-      fwrite(pointer->symbol,
-	     strlen(pointer->symbol),
-	     1,
-	     dictfd); // strlen = w/o terminator
-      
-      fwrite(&terminator,
-	     sizeof(char),
-	     1,
-	     dictfd); // we are adding now manually...
-      
-      pointer = pointer->next;
-    }
-
-  /* we just reuse var terminator, number not important */
-  fwrite(&terminator,2,1,dictfd);
-  fwrite(&dictend,sizeof(dictend),1,dictfd);
-}
-
-// read a dictionary from dictfd
-ticker_dict_t* ReadDictionary(ticker_dict_t* ticker_dictionary_start, FILE* dictfd)
-{
-  ID_DICT_T number=0;
-
-  char* line = NULL;
-  char* symbol=NULL;
-  size_t len,read;
-
-  // TODO check read
-  while(fread(&number,sizeof(ID_DICT_T),1,dictfd) &&
-	(read=getdelim(&line,&len,0x0000,dictfd)))
-    {
-      symbol=realloc(symbol,strlen(line)+1);
-      memcpy(symbol,line,(size_t)strlen(line));
-
-      // end of dictionary
-      if(strcmp(symbol,ENDOFDICTIONARY)==0)
-	{
-	  break;
-	}
-      symbol[strlen(line)]='\0';
-      
-      ticker_dictionary_start=AddDictList(symbol,
-					  ticker_dictionary_start,
-					  &number);
-    }
-  
-  if(errno)
-    perror("reading dictionary");
-  
-  free(line);
-  free(symbol);
-
-  return ticker_dictionary_start;
-}
-
-// main encoding function
-void do_compress(FILE *inputfh,FILE *outputfh,ticker_dict_t* ticker_dictionary_start)
-{
-
-  char line[MAXLINELENGTH]; /* max line length */
-  struct TradeRecord_t RecordLine;
-  ID_DICT_T DictionaryNumber=1;
-  ID_DICT_T TmpDictionaryNumber=0;
-  FILE *dictfh;
     
-  int64_t timediff=0;
-  uint32_t last_time=0;
-  uint16_t SizeSmall=0;
-  SPRICETYPE PriceSmall=0;
-  char last_exchange=0;
-
-
-  // is we run in debug mode we write the dictionary to a temp file
-  // which will get automatically deleted
-  if(debug)
-    {
-      dictfh = tmpfile();
-      if(dictfh == NULL)
-	{
-	  perror("Error opening/creating dictionary file");
-	  exit(-1);
-	}
-    }
-  else
-    {
-      dictfh=outputfh;
-    }
-
-  // Pass 1
-  printf("Pass 1 - building dictionary\n");
-  
-  while (fgets(line, sizeof(line), inputfh) != NULL)
-  {
-    line[strcspn(line, "\r\n")] = 0; // remove line end(s)
-    
-    RecordLine=parse_CSV(line);
-
-    // if we don't know the ticker yet, we add it to the list
-    // otherwise increase the frequency
-    if(!DictListSearch(RecordLine.ticker,ticker_dictionary_start))
-      {
-	ticker_dictionary_start=AddDictList(RecordLine.ticker,
-					    ticker_dictionary_start,
-					    &DictionaryNumber);
-      }
-    else
-      {
-	IncDictListEntry(RecordLine.ticker,ticker_dictionary_start);
-      }
-    
-    free(RecordLine.ticker);
-  }
-
-  rewind(inputfh);
-  
-  printf("Pass 2 - encoding data\n");
-
-  // write dictionary
-  DumpDictionary(ticker_dictionary_start,dictfh);
-
-  while (fgets(line, sizeof(line), inputfh) != NULL)
-  {
-    line[strcspn(line, "\r\n")] = 0; // remove line end(s)
-
-    RecordLine=parse_CSV(line);
-
-    // if the difference to the previous time is small enough
-    // use a small value
-    timediff=RecordLine.sendtime-last_time;
-    if(abs(timediff)>254 || last_time>RecordLine.sendtime)
-      {
-	RecordLine.sendtimediff=0;
-      }
-    else
-      {
-	RecordLine.sendtimediff=timediff;
-	RecordLine.flags=setBit(4,RecordLine.flags);
-      }
-
-    // same exchange as previous?
-    if(last_exchange==RecordLine.exchange)
-      {
-	RecordLine.flags=setBit(5,RecordLine.flags);
-      }
-
-    // small size?
-    if(RecordLine.size<65534)
-      {
-	SizeSmall=RecordLine.size;
-	RecordLine.flags=setBit(6,RecordLine.flags);
-      }
-
-    // small price?
-    if(abs(RecordLine.price.integer)<32767)
-      {
-	PriceSmall=RecordLine.price.integer;
-	RecordLine.flags=setBit(7,RecordLine.flags);
-      }
-
-    // look up the ID for the ticker
-    TmpDictionaryNumber=FindDictListEntry(RecordLine.ticker,
-					  ticker_dictionary_start);
-
-    // write ID, condition, flags and the mantissa
-    fwrite(&TmpDictionaryNumber,
-	   sizeof(ID_DICT_T),
-	   1,
-	   outputfh); /* Ticker 16bit 0-65535 2b*/
-    
-    fwrite(&RecordLine.condition,
-	   sizeof(RecordLine.condition),
-	   1,outputfh); /* condition 8bit 1b */
-    
-    fwrite(&RecordLine.flags,
-	   sizeof(RecordLine.flags),
-	   1,
-	   outputfh); /* flags 8bit 1b */
-    
-    fwrite(&RecordLine.price.mantissa,
-	   sizeof(RecordLine.price.mantissa),
-	   1,
-	   outputfh); /* mantissa 8bit 1b*/
-
-    // write extra data or small/large data
-    
-    if(getBit(7,RecordLine.flags))
-      {
-	fwrite(&PriceSmall,
-	       sizeof(PriceSmall),
-	       1,
-	       outputfh); /* 16bit 2b*/
-      }
-    else
-      {
-	fwrite(&RecordLine.price.integer,
-	       sizeof(RecordLine.price.integer),
-	       1,
-	       outputfh); /* 32bit 4b*/    	
-      }
-    
-    if(getBit(6,RecordLine.flags))
-      {
-	fwrite(&SizeSmall,
-	       sizeof(SizeSmall),
-	       1,
-	       outputfh); /* 16bit 2b*/
-      }
-    else
-      {
-	fwrite(&RecordLine.size,
-	       sizeof(RecordLine.size),
-	       1,
-	       outputfh); /* 32bit 4b*/
-      }
-
-    if(!getBit(5,RecordLine.flags))
-      {
-	fwrite(&RecordLine.exchange,
-	       sizeof(RecordLine.exchange),
-	       1,
-	       outputfh); /* exchange 8bit */
-      }
-       
-    if(getBit(4,RecordLine.flags))
-      {
-	fwrite(&RecordLine.sendtimediff,
-	       sizeof(RecordLine.sendtimediff),
-	       1,
-	       outputfh); /* sendtimediff 8bit */
-      }
-    else
-      {
-	fwrite(&RecordLine.sendtime,
-	       sizeof(RecordLine.sendtime),
-	       1,
-	       outputfh); /* sendtime 32bit */
-      }
-    
-    if(!getBit(3,RecordLine.flags))
-      {
-	fwrite(&RecordLine.recvtime,
-	       sizeof(RecordLine.recvtime),
-	       1,
-	       outputfh); /* sendtime 32bit */
-      }
-    free(RecordLine.ticker);
-    last_exchange=RecordLine.exchange;
-    last_time=RecordLine.sendtime;
-  }
-
-  
-}
-
-// main decrompression routine
-void do_decompress(FILE *inputfh,FILE *outputfh,ticker_dict_t* ticker_dictionary_start)
-{
-  
-  size_t read;
-  char input_data[RECORDSIZE];
-  void *cursor;
-  TradeRecord_t RecordLine;
-  ID_DICT_T* entry=malloc(sizeof(ID_DICT_T));
-  char* symbol;
-  uint16_t SizeSmall=0;
-  char last_exchange=0;
-  SPRICETYPE PriceSmall=0;
-  
-  uint32_t last_time=0;
-  
-  printf("decompressing\n");
-
-  // read the dictionary
-  ticker_dictionary_start=ReadDictionary(ticker_dictionary_start, inputfh);
-
-
-  // read first the fixed record
-  // copy the data into the vars and process some flags
-  while((read=fread(&input_data,RECORDSIZE,1,inputfh)))
-    {
-      memcpy(entry,input_data,sizeof(ID_DICT_T));
-      cursor=input_data+sizeof(ID_DICT_T);
-      
-      memcpy(&RecordLine.condition,cursor,sizeof(RecordLine.condition));
-      cursor+=sizeof(RecordLine.condition);    
-
-      memcpy(&RecordLine.flags,cursor,sizeof(RecordLine.flags));
-      cursor+=sizeof(RecordLine.flags);
-
-      memcpy(&RecordLine.price.mantissa,cursor,sizeof(RecordLine.price.mantissa));
-      cursor+=sizeof(RecordLine.price.mantissa);
-
-      if(    getBit(0,RecordLine.flags)
-	 && !getBit(1,RecordLine.flags)
-	 && !getBit(2,RecordLine.flags))
-	{
-	  RecordLine.side='A';
-	}
-      else if(!getBit(0,RecordLine.flags)
-	 &&    getBit(1,RecordLine.flags)
-	 &&   !getBit(2,RecordLine.flags))
-	{
-	  RecordLine.side='a';
-	}
-      else if(getBit(0,RecordLine.flags)
-	 &&   getBit(1,RecordLine.flags)
-	 &&  !getBit(2,RecordLine.flags))
-	{
-	  RecordLine.side='B';
-	}
-      else if(!getBit(0,RecordLine.flags)
-	 &&   !getBit(1,RecordLine.flags)
-	 &&    getBit(2,RecordLine.flags))
-	{
-	  RecordLine.side='b';
-	}
-      else if(getBit(0,RecordLine.flags)
-	 &&  !getBit(1,RecordLine.flags)
-	 &&   getBit(2,RecordLine.flags))
-	{
-	  RecordLine.side='T';
-	}
-
-
-      // large or small price?
-      if(getBit(7,RecordLine.flags))
-	{
-	  read=fread(&input_data,2,1,inputfh);
-	  
-	  memcpy(&PriceSmall,
-		 input_data,
-		 sizeof(PriceSmall));
-	  
-	  RecordLine.price.integer=PriceSmall;
-	}
-      else
-	{
-	  read=fread(&input_data,4,1,inputfh);
-	  memcpy(&RecordLine.price.integer,
-		 input_data,
-		 sizeof(RecordLine.price.integer));
-	}
-
-      // convert the price into a string
-      char* buf=parse_price_out(RecordLine.price,buf);
-
-      // small or large size
-      if(getBit(6,RecordLine.flags))
-	{	  
-	  read=fread(&input_data,2,1,inputfh);
-	  
-	  memcpy(&SizeSmall,
-		 input_data,
-		 sizeof(SizeSmall));
-	  
-	  RecordLine.size=SizeSmall;
-	}
-      else
-	{
-	  read=fread(&input_data,4,1,inputfh);
-	  
-	  memcpy(&RecordLine.size,
-		 input_data,
-		 sizeof(RecordLine.size));
-	}
-
-      // new or previous exchange
-      if(getBit(5,RecordLine.flags))
-	{
-	  RecordLine.exchange=last_exchange;
-	}
-      else
-	{
-	  read=fread(&input_data,1,1,inputfh);
-	  
-	  memcpy(&RecordLine.exchange,
-		 input_data,
-		 sizeof(RecordLine.exchange));
-	}
-	                
-      // diff or full timestamp?
-      if(getBit(4,RecordLine.flags))
-	{	  
-	  read=fread(&input_data,1,1,inputfh);
-	  
-	  memcpy(&RecordLine.sendtimediff,
-		 input_data,
-		 sizeof(RecordLine.sendtimediff));
-	  
-	  RecordLine.sendtime=last_time+RecordLine.sendtimediff;
-	}
-      else
-	{
-	  read=fread(&input_data,4,1,inputfh);
-	  
-	  memcpy(&RecordLine.sendtime,
-		 input_data,
-		 sizeof(RecordLine.sendtime));
-	}
-
-      // same times or different?
-      if(getBit(3,RecordLine.flags))
-	{
-	  RecordLine.recvtime=RecordLine.sendtime;
-	}
-      else
-	{
-	  read=fread(&input_data,4,1,inputfh);
-	  
-	  memcpy(&RecordLine.recvtime,
-		 input_data,
-		 sizeof(RecordLine.recvtime));
-	}
-      
-
-      // look up the ID
-      symbol=FindDictListSymbol(*entry,ticker_dictionary_start);
-      
-      fprintf(outputfh, "%s,%c,%c,%c,%d,%d,%s,%d%s",
-	      symbol,
-	      RecordLine.exchange,
-	      RecordLine.side,
-	      RecordLine.condition,
-	      RecordLine.sendtime,
-	      RecordLine.recvtime,
-	      buf,
-	      RecordLine.size,
-	      LINEEND
-	      );
-      
-      free(buf);
-      
-      last_time=RecordLine.sendtime;
-      last_exchange=RecordLine.exchange;
-    }
-}
-  
-int main (int argc, char **argv)
-{
-  /* default compressing */
-  bool  compress = true;
-
-  /* filehandles */
-  char *InputFileName = NULL;
-  char *OutputFileName = NULL;
-  FILE *inputfh, *outputfh;
-
-  /* list to keep the dictionary */
-  ticker_dict_t* ticker_dictionary_start=NULL;
-  
-  int options;
-
-
-  opterr = 0;
-
-  while ((options = getopt (argc, argv, "cdx")) != -1)
-    switch (options)
-      {
-      case 'c':
-        compress = 1;
-        break;
-      case 'd':
-        compress = 0;
-        break;
-      case 'x':
-	debug =1;
-	break;
-      case '?':
-        if (isprint (optopt))
-          fprintf (stderr, "Unknown option `-%c'.\n", optopt);
-        else
-          fprintf (stderr,
-                   "Unknown option character `\\x%x'.\n",
-                   optopt);
-        return 1;
-      default:
-        abort ();
-      }
-
-
-  if ( argc - optind <= 1 || argc - optind > 2 )
-    {
-      usage();
-      exit(-1);
-    }
-  
-  InputFileName=malloc(strlen(argv[optind]));
-  strcpy(InputFileName,argv[optind]);
-  inputfh = fopen(InputFileName,"r");
-  if(inputfh == NULL)
-    {
-      perror("Error opening inout file");
-      exit(-1);
+    if (argc - optind != 2) {
+        fprintf(stderr, "Usage: compress [-c|-d|-x] <inputfile> <outputfile>\n");
+        exit(EXIT_FAILURE);
     }
     
-  OutputFileName=malloc(strlen(argv[optind+1]));
-  strcpy(OutputFileName,argv[optind+1]);  
-  outputfh = fopen(OutputFileName,"w+");   /* we overwrite the file if it exists -
-					      TODO:should be tested first... */
-  if(outputfh == NULL)
-    {
-      perror("Error opening output file");
-      exit(-1);
+    input_filename = argv[optind];
+    output_filename = argv[optind+1];
+    
+    input_file = fopen(input_filename, "r");
+    if (!input_file) {
+        perror("Error opening input file");
+        exit(EXIT_FAILURE);
     }
     
-  if (compress)
-    {
-      printf("compressing...%s into %s\n",InputFileName,OutputFileName);
-      do_compress(inputfh,outputfh,ticker_dictionary_start);
+    output_file = fopen(output_filename, "w+");  /* Overwrite existing file */
+    if (!output_file) {
+        perror("Error opening output file");
+        fclose(input_file);
+        exit(EXIT_FAILURE);
     }
-  else
-    {
-      printf("decompressing...%s into %s\n",InputFileName,OutputFileName);
-      do_decompress(inputfh,outputfh,ticker_dictionary_start);
+    
+    if (compress) {
+        printf("Compressing %s into %s\n", input_filename, output_filename);
+        do_compress(input_file, output_file, ticker_dict);
+    } else {
+        printf("Decompressing %s into %s\n", input_filename, output_filename);
+        do_decompress(input_file, output_file, ticker_dict);
     }
-
-
-  DestroyDictList(ticker_dictionary_start);
-
-  fclose(inputfh);
-  fclose(outputfh);
-
-  free(InputFileName);
-  free(OutputFileName);
-
-  return 0;
+    
+    destroy_dict_list(ticker_dict);
+    
+    fclose(input_file);
+    fclose(output_file);
+    
+    return EXIT_SUCCESS;
 }
