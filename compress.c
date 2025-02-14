@@ -12,7 +12,7 @@
 
 #define ID_DICT_T uint16_t
 #define ENDOFDICTIONARY "ENDOFDICTIONARY"
-#define LINEEND "\r\n"
+#define LINEEND ""
 
 #define PRICETYPE int32_t
 #define SPRICETYPE int16_t

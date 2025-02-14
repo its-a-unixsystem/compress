@@ -19,7 +19,7 @@ $(TARGET): $(OBJ)
 # 3. Decompress it back to CSV.
 # 4. Compare the original CSV to the decompressed CSV.
 test: $(TARGET)
-	@echo "AAPL,N,A,?,123456789,123456789,123.45,100" > test_input.csv
+	@echo -n "AAPL,N,A,?,123456789,123456789,123.45,100" > test_input.csv
 	@echo "Running compression..."
 	./$(TARGET) -c test_input.csv test_output.bin
 	@echo "Running decompression..."
